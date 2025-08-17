@@ -41,17 +41,11 @@ def parse_scales(s:str):
     except:
         return [1.00]
 
-def make_tpl_and_mask(path:str):
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if img is None: return None, None, None
-    img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-    _, bw = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY|cv2.THRESH_OTSU)
-    if np.count_nonzero(bw) < 20:
-        _, bw = cv2.threshold(img, 180, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
-    mask = cv2.dilate(bw, kernel, iterations=1)
-    tpl_edge = cv2.Canny(cv2.GaussianBlur(img,(3,3),0), 50, 150)
-    return img, mask, tpl_edge
+def make_tpl_and_mask(path: str):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)  # <<< leer en color
+    if img is None: 
+        return None, None, None
+    return img, None, None   # devolvemos solo la imagen
 
 def hist_similarity(img1, img2):
     h1 = cv2.calcHist([img1],[0],None,[256],[0,256])
@@ -101,7 +95,7 @@ def main():
             for f in os.listdir(folder):
                 if f.lower().endswith(".png"):
                     g,m,e = make_tpl_and_mask(os.path.join(folder,f))
-                    if g is not None: templates[f] = (g,m,e)
+                    if g is not None: templates[f] = (g,m,e)   # g ya es gris normalizado
             if not templates:
                 print("[ERROR] No se cargó ninguna plantilla desde /items"); return
         else:
@@ -112,6 +106,7 @@ def main():
         scales = parse_scales(args.scales)
         period = 1.0 / max(args.fps, 0.1)
         tmp_png = os.path.abspath("_wgc_tmp.png")
+        last_gray_path = os.path.abspath("_last_frame_gray.png")  # <<< aquí guardamos SIEMPRE el último frame ya en gris
         os.makedirs(args.hits, exist_ok=True)
 
         cap = WindowsCapture(cursor_capture=False, monitor_index=None, window_name=win32gui.GetWindowText(hwnd) or args.title)
@@ -128,38 +123,50 @@ def main():
             try:
                 last_proc_ts = now
                 img = cv2.imread(path_png, cv2.IMREAD_UNCHANGED)
-                if img is None: return
-                frame_gray = img if img.ndim==2 else (
-                    cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY) if img.shape[2]==4 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                )
-                frame_gray = cv2.normalize(frame_gray, None, 0, 255, cv2.NORM_MINMAX)
+                if img is None: 
+                    return
 
-                for name,(tpl_gray_base,_,_) in templates.items():
+                # Si viene con alpha → descartar alpha
+                if img.ndim == 3 and img.shape[2] == 4:
+                    frame_color = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                else:
+                    frame_color = img
+
+                for name,(tpl_color_base,_,_) in templates.items():
                     best_score, best_loc, best_size = 0.0, None, (0,0)
                     for s in scales:
                         interp = cv2.INTER_AREA if s<1.0 else cv2.INTER_CUBIC
-                        tpl_g = cv2.resize(tpl_gray_base, None, fx=s, fy=s, interpolation=interp) if s!=1.0 else tpl_gray_base
-                        th,tw = tpl_g.shape[:2]
-                        if th<1 or tw<1 or th>frame_gray.shape[0] or tw>frame_gray.shape[1]: continue
-                        res = cv2.matchTemplate(frame_gray, tpl_g, cv2.TM_CCOEFF_NORMED)
+                        tpl_c = cv2.resize(tpl_color_base, None, fx=s, fy=s, interpolation=interp) if s!=1.0 else tpl_color_base
+                        th,tw = tpl_c.shape[:2]
+                        if th<1 or tw<1 or th>frame_color.shape[0] or tw>frame_color.shape[1]: 
+                            continue
+                        res = cv2.matchTemplate(frame_color, tpl_c, cv2.TM_CCOEFF_NORMED)
                         _, score, _, loc = cv2.minMaxLoc(res)
                         if score > best_score:
                             best_score, best_loc, best_size = score, loc, (tw,th)
 
                     if best_loc is not None and best_score >= args.threshold:
                         x,y = best_loc
-                        roi = frame_gray[y:y+best_size[1], x:x+best_size[0]]
-                        roi_resized = cv2.resize(roi, (tpl_gray_base.shape[1], tpl_gray_base.shape[0]))
-                        ssim_val = ssim(tpl_gray_base, roi_resized)
-                        hist_val = hist_similarity(tpl_gray_base, roi_resized)
+                        roi = frame_color[y:y+best_size[1], x:x+best_size[0]]
+                        roi_resized = cv2.resize(roi, (tpl_color_base.shape[1], tpl_color_base.shape[0]))
+
+                        # Para verificación, convertir a gris SOLO aquí
+                        roi_gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
+                        tpl_gray = cv2.cvtColor(tpl_color_base, cv2.COLOR_BGR2GRAY)
+                        ssim_val = ssim(tpl_gray, roi_gray)
+                        hist_val = hist_similarity(tpl_gray, roi_gray)
 
                         if ssim_val >= 0.85 and hist_val >= 0.5:
                             if not active_hits[name]:
                                 print(f"[HIT] {name} score={best_score:.3f}, ssim={ssim_val:.3f}, hist={hist_val:.3f}")
                                 ts=time.strftime("%Y%m%d_%H%M%S")
                                 out_path=os.path.join(args.hits, f"{name}_{ts}.png")
-                                shutil.copyfile(path_png, out_path)
-                                print(f"[SAVE] {out_path}")
+                                # Guardar el MISMO frame que se está usando (gris normalizado), no el BGRA original
+                                try:
+                                    cv2.imwrite(out_path, frame_gray)
+                                    print(f"[SAVE] {out_path}")
+                                except Exception as _:
+                                    if args.debug: print(f"[WARN] No pude guardar {out_path}")
                                 active_hits[name]=True
                             else:
                                 if args.debug: print(f"[HOLD] {name}")
