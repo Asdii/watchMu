@@ -2,6 +2,7 @@
 import time, argparse, os, shutil, cv2, numpy as np, psutil, win32gui, win32process, traceback
 from threading import Lock
 from skimage.metrics import structural_similarity as ssim
+import winsound, ctypes
 
 try:
     from windows_capture import WindowsCapture, Frame, InternalCaptureControl
@@ -10,6 +11,24 @@ except ImportError:
     raise SystemExit(1)
 
 # ==== Utilidades ====
+
+def _msgbox(text, title="Watch MU"):
+    try:
+        MB_ICONINFO = 0x40
+        MB_SETFOREGROUND = 0x00010000
+        MB_TOPMOST = 0x00040000
+        ctypes.windll.user32.MessageBoxW(None, str(text), str(title), MB_ICONINFO | MB_SETFOREGROUND | MB_TOPMOST)
+    except Exception:
+        pass
+
+def alert_user(msg="¡Item encontrado!"):
+    try:
+        wav_path = os.path.join(os.path.dirname(__file__), "alert.wav")
+        if os.path.exists(wav_path):
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception:
+        pass
+    _msgbox(msg, "Watch MU")
 
 def find_hwnd_by_title(title_contains: str):
     title_contains = title_contains.lower()
@@ -42,14 +61,16 @@ def parse_scales(s:str):
         return [1.00]
 
 def make_tpl_and_mask(path: str):
-    img = cv2.imread(path, cv2.IMREAD_COLOR)  # <<< leer en color
-    if img is None: 
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
         return None, None, None
-    return img, None, None   # devolvemos solo la imagen
+    return img, None, None
 
 def hist_similarity(img1, img2):
-    h1 = cv2.calcHist([img1],[0],None,[256],[0,256])
-    h2 = cv2.calcHist([img2],[0],None,[256],[0,256])
+    g1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if (img1.ndim==3 and img1.shape[2]==3) else img1
+    g2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if (img2.ndim==3 and img2.shape[2]==3) else img2
+    h1 = cv2.calcHist([g1],[0],None,[256],[0,256])
+    h2 = cv2.calcHist([g2],[0],None,[256],[0,256])
     cv2.normalize(h1,h1); cv2.normalize(h2,h2)
     return cv2.compareHist(h1,h2,cv2.HISTCMP_CORREL)
 
@@ -86,16 +107,16 @@ def main():
             tpl_path = os.path.abspath(args.template)
             if not os.path.exists(tpl_path):
                 print("[ERROR] No existe la plantilla única"); return
-            g,m,e = make_tpl_and_mask(tpl_path)
-            templates[os.path.basename(tpl_path)] = (g,m,e)
+            g,_,_ = make_tpl_and_mask(tpl_path)
+            templates[os.path.basename(tpl_path)] = (g,None,None)
         elif args.items:
             folder = os.path.abspath(args.items)
             if not os.path.isdir(folder):
                 print("[ERROR] Carpeta inválida"); return
             for f in os.listdir(folder):
                 if f.lower().endswith(".png"):
-                    g,m,e = make_tpl_and_mask(os.path.join(folder,f))
-                    if g is not None: templates[f] = (g,m,e)   # g ya es gris normalizado
+                    g,_,_ = make_tpl_and_mask(os.path.join(folder,f))
+                    if g is not None: templates[f] = (g,None,None)
             if not templates:
                 print("[ERROR] No se cargó ninguna plantilla desde /items"); return
         else:
@@ -106,7 +127,6 @@ def main():
         scales = parse_scales(args.scales)
         period = 1.0 / max(args.fps, 0.1)
         tmp_png = os.path.abspath("_wgc_tmp.png")
-        last_gray_path = os.path.abspath("_last_frame_gray.png")  # <<< aquí guardamos SIEMPRE el último frame ya en gris
         os.makedirs(args.hits, exist_ok=True)
 
         cap = WindowsCapture(cursor_capture=False, monitor_index=None, window_name=win32gui.GetWindowText(hwnd) or args.title)
@@ -123,10 +143,9 @@ def main():
             try:
                 last_proc_ts = now
                 img = cv2.imread(path_png, cv2.IMREAD_UNCHANGED)
-                if img is None: 
-                    return
+                if img is None: return
 
-                # Si viene con alpha → descartar alpha
+                # asegurar BGR (si viene con alpha)
                 if img.ndim == 3 and img.shape[2] == 4:
                     frame_color = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                 else:
@@ -138,7 +157,7 @@ def main():
                         interp = cv2.INTER_AREA if s<1.0 else cv2.INTER_CUBIC
                         tpl_c = cv2.resize(tpl_color_base, None, fx=s, fy=s, interpolation=interp) if s!=1.0 else tpl_color_base
                         th,tw = tpl_c.shape[:2]
-                        if th<1 or tw<1 or th>frame_color.shape[0] or tw>frame_color.shape[1]: 
+                        if th<1 or tw<1 or th>frame_color.shape[0] or tw>frame_color.shape[1]:
                             continue
                         res = cv2.matchTemplate(frame_color, tpl_c, cv2.TM_CCOEFF_NORMED)
                         _, score, _, loc = cv2.minMaxLoc(res)
@@ -149,24 +168,22 @@ def main():
                         x,y = best_loc
                         roi = frame_color[y:y+best_size[1], x:x+best_size[0]]
                         roi_resized = cv2.resize(roi, (tpl_color_base.shape[1], tpl_color_base.shape[0]))
-
-                        # Para verificación, convertir a gris SOLO aquí
                         roi_gray = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2GRAY)
                         tpl_gray = cv2.cvtColor(tpl_color_base, cv2.COLOR_BGR2GRAY)
                         ssim_val = ssim(tpl_gray, roi_gray)
-                        hist_val = hist_similarity(tpl_gray, roi_gray)
+                        hist_val = hist_similarity(tpl_color_base, roi_resized)
 
                         if ssim_val >= 0.85 and hist_val >= 0.5:
                             if not active_hits[name]:
                                 print(f"[HIT] {name} score={best_score:.3f}, ssim={ssim_val:.3f}, hist={hist_val:.3f}")
                                 ts=time.strftime("%Y%m%d_%H%M%S")
                                 out_path=os.path.join(args.hits, f"{name}_{ts}.png")
-                                # Guardar el MISMO frame que se está usando (gris normalizado), no el BGRA original
                                 try:
-                                    cv2.imwrite(out_path, frame_gray)
+                                    cv2.imwrite(out_path, frame_color)
                                     print(f"[SAVE] {out_path}")
                                 except Exception as _:
                                     if args.debug: print(f"[WARN] No pude guardar {out_path}")
+                                alert_user(f"Encontrado: {name}")
                                 active_hits[name]=True
                             else:
                                 if args.debug: print(f"[HOLD] {name}")
