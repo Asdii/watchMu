@@ -11,7 +11,6 @@ except ImportError:
     raise SystemExit(1)
 
 # ==== Utilidades ====
-
 def _msgbox(text, title="Watch MU"):
     try:
         MB_ICONINFO = 0x40
@@ -21,9 +20,13 @@ def _msgbox(text, title="Watch MU"):
     except Exception:
         pass
 
-def alert_user(msg="¡Item encontrado!"):
+def alert_user(msg="¡Item encontrado!", attacked=False):
+    print(attacked)
     try:
-        wav_path = os.path.join(os.path.dirname(__file__), "alert.wav")
+        if attacked:
+            wav_path = os.path.join(os.path.dirname(__file__), "attacked.wav")
+        else:
+            wav_path = os.path.join(os.path.dirname(__file__), "alert.wav")
         if os.path.exists(wav_path):
             winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
     except Exception:
@@ -87,6 +90,7 @@ def main():
         ap.add_argument("--fps", type=float, default=1.0)
         ap.add_argument("--hits", default="hits")
         ap.add_argument("--scales", default="1.00")
+        ap.add_argument("--window_number", default=1)
         ap.add_argument("--debug", action="store_true")
         args = ap.parse_args()
 
@@ -126,16 +130,18 @@ def main():
 
         scales = parse_scales(args.scales)
         period = 1.0 / max(args.fps, 0.1)
-        tmp_png = os.path.abspath("_wgc_tmp.png")
+        tmp_png = os.path.abspath(f"_wgc_tmp_{args.window_number}.png")
         os.makedirs(args.hits, exist_ok=True)
 
         cap = WindowsCapture(cursor_capture=False, monitor_index=None, window_name=win32gui.GetWindowText(hwnd) or args.title)
-
+        
+        was_on_hold = False
         last_proc_ts = 0.0
         proc_lock = Lock()
         active_hits = {name: False for name in templates}
 
         def process_png(path_png: str):
+            nonlocal was_on_hold
             nonlocal last_proc_ts
             now = time.time()
             if now - last_proc_ts < period: return
@@ -175,15 +181,17 @@ def main():
 
                         if ssim_val >= 0.85 and hist_val >= 0.5:
                             if not active_hits[name]:
-                                print(f"[HIT] {name} score={best_score:.3f}, ssim={ssim_val:.3f}, hist={hist_val:.3f}")
+                                if name == "sd.png":
+                                    was_on_hold = True
+                                if name != "sd.png": print(f"[HIT] {name} score={best_score:.3f}, ssim={ssim_val:.3f}, hist={hist_val:.3f}")
                                 ts=time.strftime("%Y%m%d_%H%M%S")
                                 out_path=os.path.join(args.hits, f"{name}_{ts}.png")
                                 try:
-                                    cv2.imwrite(out_path, frame_color)
-                                    print(f"[SAVE] {out_path}")
+                                    if name != "sd.png": cv2.imwrite(out_path, frame_color)
+                                    if name != "sd.png": print(f"[SAVE] {out_path}")
                                 except Exception as _:
                                     if args.debug: print(f"[WARN] No pude guardar {out_path}")
-                                alert_user(f"Encontrado: {name}")
+                                if name != "sd.png": alert_user(f"{name.replace('.png', '').replace('_', ' ').capitalize()} encontrado en ventana: {args.window_number}", False)
                                 active_hits[name]=True
                             else:
                                 if args.debug: print(f"[HOLD] {name}")
@@ -193,6 +201,9 @@ def main():
                     else:
                         if args.debug: print(f"[MISS] {name} mejor score={best_score:.3f}")
                         active_hits[name]=False
+                        if was_on_hold and name == "sd.png":
+                            alert_user(f"¡¡Nos atacan!! Ventana: {args.window_number}", True)
+                            was_on_hold = False
             finally:
                 try:
                     if os.path.exists(path_png): os.remove(path_png)
